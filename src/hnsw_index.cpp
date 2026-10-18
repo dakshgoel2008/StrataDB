@@ -44,6 +44,12 @@ bool farther(const C& a, const C& b) {
     return closer(b, a);
 }
 
+// Asks the CPU to start loading the first 128 bytes of a vector into cache.
+inline void prefetch(const float* v) {
+    __builtin_prefetch(v);
+    __builtin_prefetch(v + 16);
+}
+
 // Small helpers for the temporary file format.
 struct FileCloser {
     void operator()(std::FILE* f) const noexcept { std::fclose(f); }
@@ -268,6 +274,7 @@ std::vector<HnswIndex::Candidate> HnswIndex::search_layer(const float* query,
     }
 
     std::vector<NodeId> neighbors;
+    std::vector<NodeId> fresh;
     while (!to_visit.empty()) {
         const Candidate current = to_visit.front();
         // Stop once the closest unexplored node is farther than everything we keep.
@@ -278,10 +285,16 @@ std::vector<HnswIndex::Candidate> HnswIndex::search_layer(const float* query,
         to_visit.pop_back();
 
         copy_links(current.id, level, neighbors);
+        // First pick the unvisited neighbors and start loading their vectors, so
+        // the memory reads overlap instead of each distance waiting for its own.
+        fresh.clear();
         for (NodeId n : neighbors) {
-            if (visited.check_and_mark(n)) {
-                continue;
+            if (!visited.check_and_mark(n)) {
+                fresh.push_back(n);
+                prefetch(vector_of(n));
             }
+        }
+        for (NodeId n : fresh) {
             const float d = distance_(query, vector_of(n), dim_);
             if (best.size() < ef || d < best.front().distance) {
                 to_visit.push_back({d, n});

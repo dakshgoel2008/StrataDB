@@ -51,6 +51,8 @@ struct Options {
     std::size_t threads = 0;
     int search_cpu = 2;
     std::size_t max_queries = 0;
+    std::string simd;  // empty = fastest this CPU supports
+    std::size_t repeats = 3;
 };
 
 // What a library needs to provide to be measured.
@@ -73,7 +75,9 @@ public:
           ids_(opt.k),
           distances_(opt.k) {}
 
-    std::string name() const override { return "strata"; }
+    std::string name() const override {
+        return "strata-" + std::string(strata::simd_level_name(strata::active_simd_level()));
+    }
     std::string version() const override { return std::string(strata::version()); }
 
     void add(const float* data, std::size_t n, std::size_t, std::size_t threads) override {
@@ -264,18 +268,25 @@ void run(const std::string& lib, const Options& opt) {
             searcher->search(queries.row(q), opt.k, found.row(q));
         }
 
-        sb::LatencyRecorder latency;
-        latency.reserve(queries.rows);
-        sb::Stopwatch total;
-        for (std::size_t q = 0; q < queries.rows; ++q) {
-            sb::Stopwatch one;
-            searcher->search(queries.row(q), opt.k, found.row(q));
-            latency.add(one.elapsed_ns());
+        // A laptop's speed drifts with temperature, so run several times and keep the median run.
+        std::vector<std::pair<double, sb::LatencySummary>> runs;
+        for (std::size_t r = 0; r < opt.repeats; ++r) {
+            sb::LatencyRecorder latency;
+            latency.reserve(queries.rows);
+            sb::Stopwatch total;
+            for (std::size_t q = 0; q < queries.rows; ++q) {
+                sb::Stopwatch one;
+                searcher->search(queries.row(q), opt.k, found.row(q));
+                latency.add(one.elapsed_ns());
+            }
+            runs.emplace_back(static_cast<double>(queries.rows) / total.elapsed_s(),
+                              latency.summarize());
         }
-        const double seconds = total.elapsed_s();
+        std::sort(runs.begin(), runs.end(),
+                  [](const auto& a, const auto& b) { return a.first < b.first; });
+        const auto& median = runs[runs.size() / 2];
 
-        Point p{ef, sb::recall_at_k(found, truth, opt.k),
-                static_cast<double>(queries.rows) / seconds, latency.summarize()};
+        Point p{ef, sb::recall_at_k(found, truth, opt.k), median.first, median.second};
         std::printf("  ef=%4zu  recall@%zu=%.4f  qps=%8.0f  p99=%8.1f us\n", ef, opt.k, p.recall,
                     p.qps, p.latency.p99_us);
         points.push_back(p);
@@ -293,9 +304,11 @@ void run(const std::string& lib, const Options& opt) {
         << ",\n  \"k\": " << opt.k << ",\n  \"M\": " << opt.M
         << ",\n  \"ef_construction\": " << opt.ef_construction << ",\n  \"build_threads\": "
         << (opt.threads ? opt.threads : std::thread::hardware_concurrency())
+        << ",\n  \"repeats\": " << opt.repeats
         << ",\n  \"search_threads\": 1,\n  \"search_cpu\": " << opt.search_cpu
-        << ",\n  \"build_seconds\": " << build_s << ",\n  \"hardware\": {\"cpu\": \"" << cpu_model()
-        << "\"},\n  \"points\": [\n";
+        << ",\n  \"simd\": \"" << strata::simd_level_name(strata::active_simd_level())
+        << "\",\n  \"build_seconds\": " << build_s << ",\n  \"hardware\": {\"cpu\": \""
+        << cpu_model() << "\"},\n  \"points\": [\n";
     for (std::size_t i = 0; i < points.size(); ++i) {
         const Point& p = points[i];
         out << "    {\"ef_search\": " << p.ef << ", \"recall\": " << p.recall
@@ -337,6 +350,10 @@ Options parse_args(int argc, char** argv) {
             opt.search_cpu = std::stoi(value);
         } else if (key == "--queries") {
             opt.max_queries = std::stoul(value);
+        } else if (key == "--simd") {
+            opt.simd = value;
+        } else if (key == "--repeats") {
+            opt.repeats = std::max<std::size_t>(1, std::stoul(value));
         } else {
             throw std::invalid_argument("unknown option " + key);
         }
@@ -352,6 +369,13 @@ Options parse_args(int argc, char** argv) {
 int main(int argc, char** argv) {
     try {
         const Options opt = parse_args(argc, argv);
+        if (!opt.simd.empty()) {
+            const auto level = strata::parse_simd_level(opt.simd);
+            if (!level) {
+                throw std::invalid_argument("unknown --simd level '" + opt.simd + "'");
+            }
+            strata::set_simd_level(*level);
+        }
         if (opt.lib == "strata" || opt.lib == "both") {
             run("strata", opt);
         }
@@ -362,7 +386,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr,
                      "error: %s\nusage: %s --dataset NAME [--lib strata|hnswlib|both] [--M 16]\n"
                      "       [--ef-construction 200] [--k 10] [--threads N] [--search-cpu 2]\n"
-                     "       [--queries N]\n",
+                     "       [--queries N] [--simd scalar|autovec|avx2|avx512]\n"
+                     "       [--repeats 3]\n",
                      e.what(), argv[0]);
         return 2;
     } catch (const std::exception& e) {
