@@ -5,6 +5,7 @@ add_library(strata
   metric.cpp
   distance.cpp
   flat_index.cpp
+  hnsw_index.cpp
 )
 
 target_include_directories(strata PUBLIC ${PROJECT_SOURCE_DIR}/include)

@@ -1,14 +1,12 @@
 #include "strata/flat_index.h"
 
 #include <algorithm>
-#include <atomic>
 #include <limits>
 #include <stdexcept>
-#include <thread>
-#include <utility>
 #include <vector>
 
 #include "strata/distance.h"
+#include "strata/parallel.h"
 
 namespace strata {
 namespace {
@@ -137,35 +135,10 @@ void FlatIndex::search_batch(std::span<const float> queries, std::size_t k, std:
         return;
     }
 
-    if (threads == 0) {
-        threads = std::max(1u, std::thread::hardware_concurrency());
-    }
-    threads = std::min(threads, nq);
-
-    // Threads take small batches of queries from a shared counter. Fast and slow
-    // cores then finish at about the same time instead of waiting on each other.
-    constexpr std::size_t kBatch = 8;
-    std::atomic<std::size_t> next{0};
-    auto worker = [&] {
-        while (true) {
-            const std::size_t start = next.fetch_add(kBatch);
-            if (start >= nq) {
-                return;
-            }
-            const std::size_t end = std::min(start + kBatch, nq);
-            for (std::size_t q = start; q < end; ++q) {
-                search(queries.subspan(q * dim_, dim_), k, ids.subspan(q * k, k),
-                       distances.subspan(q * k, k));
-            }
-        }
-    };
-
-    std::vector<std::jthread> pool;
-    pool.reserve(threads - 1);
-    for (std::size_t t = 1; t < threads; ++t) {
-        pool.emplace_back(worker);
-    }
-    worker();  // the calling thread helps too
+    parallel_for(nq, threads, [&](std::size_t q) {
+        search(queries.subspan(q * dim_, dim_), k, ids.subspan(q * k, k),
+               distances.subspan(q * k, k));
+    });
 }
 
 }  // namespace strata

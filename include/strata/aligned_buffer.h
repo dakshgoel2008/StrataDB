@@ -11,7 +11,7 @@
 namespace strata {
 
 // A growable array whose start is on a 64-byte boundary (one CPU cache line).
-// Fast vector instructions in later phases work best on memory aligned like this.
+// SIMD instructions read memory aligned like this fastest.
 template <typename T>
 class AlignedBuffer {
     static_assert(std::is_trivially_copyable_v<T>, "AlignedBuffer only holds plain values");

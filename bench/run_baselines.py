@@ -8,8 +8,8 @@ Usage:
     python bench/run_baselines.py sift
     python bench/run_baselines.py cohere-1m --libs hnswlib
 
-Each query is a Python call, which adds a few microseconds. Phase 2 compares
-against hnswlib from C++ for a fully fair comparison.
+Each query is a Python call, which adds a few microseconds. For a fully fair
+comparison from C++, use bench/hnsw_bench.cpp.
 """
 
 import argparse
