@@ -1,0 +1,110 @@
+# Build output (CMake / Ninja / Make)
+build/
+build-*/
+cmake-build-*/
+out/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+_deps/
+install_manifest.txt
+compile_commands.json
+*.ninja
+.ninja_deps
+.ninja_log
+
+# Compiled objects / binaries
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.out
+*.app
+*.pch
+*.gch
+*.d
+
+# Clang / tooling caches
+.cache/
+.clangd/
+
+# Profiling / debugging artifacts
+perf.data
+perf.data.old
+*.perf
+flamegraph*.svg
+callgrind.out.*
+massif.out.*
+vgcore.*
+/core
+*.gcda
+*.gcno
+*.gcov
+*.profraw
+*.profdata
+coverage/
+
+# Fuzzing output
+fuzz/corpus/
+fuzz/artifacts/
+crash-*
+leak-*
+timeout-*
+oom-*
+
+# Datasets (large; downloaded by scripts, never committed)
+/data/
+/datasets/
+*.fvecs
+*.ivecs
+*.bvecs
+*.hdf5
+*.parquet
+*.npy
+*.npz
+
+# Engine runtime files (test DBs, WAL, segments)
+*.wal
+*.seg
+*.tmp
+/db/
+/tmp/
+/crashtest-runs/
+
+# Benchmark raw output (keep scripts + final plots in docs/)
+bench/results/
+bench/raw/
+
+# Python (baselines, bindings, plotting)
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+.eggs/
+dist/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.#*
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Private notes (kept local)
+plan.md

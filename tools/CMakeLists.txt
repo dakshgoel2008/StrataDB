@@ -1,0 +1,2 @@
+add_executable(vecs_info vecs_info.cpp)
+target_link_libraries(vecs_info PRIVATE strata_bench_common strata_warnings)

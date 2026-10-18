@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false  # keep running the other jobs if one fails
+      matrix:
+        compiler: [gcc, clang]
+        preset: [release, asan]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Ninja
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      - name: Select compiler
+        run: |
+          if [ "${{ matrix.compiler }}" = "gcc" ]; then
+            echo "CXX=g++-14" >> "$GITHUB_ENV"
+          else
+            echo "CXX=clang++-18" >> "$GITHUB_ENV"
+          fi
+
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }} -DSTRATA_WERROR=ON
+
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }}
+
+      - name: Test
+        run: ctest --preset ${{ matrix.preset }}
