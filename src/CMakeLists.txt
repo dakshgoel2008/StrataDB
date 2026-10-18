@@ -6,6 +6,7 @@ add_library(strata
   distance.cpp
   flat_index.cpp
   hnsw_index.cpp
+  quantizer.cpp
 )
 
 # Fast distance kernels for x86. Each file gets its own CPU flags, and the

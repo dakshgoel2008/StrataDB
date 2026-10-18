@@ -50,6 +50,21 @@ inline void prefetch(const float* v) {
     __builtin_prefetch(v + 16);
 }
 
+// Copies the first k results into the output buffers and fills unused slots.
+template <typename C>
+void write_results(const std::vector<C>& found, std::size_t k, std::span<RowId> ids,
+                   std::span<float> distances) {
+    for (std::size_t i = 0; i < k; ++i) {
+        if (i < found.size()) {
+            ids[i] = found[i].id;
+            distances[i] = found[i].distance;
+        } else {
+            ids[i] = kNoRow;
+            distances[i] = std::numeric_limits<float>::infinity();
+        }
+    }
+}
+
 // Small helpers for the temporary file format.
 struct FileCloser {
     void operator()(std::FILE* f) const noexcept { std::fclose(f); }
@@ -86,6 +101,28 @@ constexpr std::uint32_t kFileVersion = 1;
 }  // namespace
 
 HnswIndex::HnswIndex(std::size_t dim, Metric metric, std::size_t capacity, HnswParams params)
+    : HnswIndex(dim, metric, capacity, params, Encoding::Float, 0) {}
+
+HnswIndex::HnswIndex(std::size_t dim, Metric metric, std::size_t capacity, HnswParams params,
+                     ScalarQuantizer quantizer)
+    : HnswIndex(dim, metric, capacity, params, Encoding::SQ8, quantizer.code_size()) {
+    if (quantizer.dim() != dim) {
+        throw std::invalid_argument("quantizer dim does not match index dim");
+    }
+    sq_ = std::make_unique<ScalarQuantizer>(std::move(quantizer));
+}
+
+HnswIndex::HnswIndex(std::size_t dim, Metric metric, std::size_t capacity, HnswParams params,
+                     ProductQuantizer quantizer)
+    : HnswIndex(dim, metric, capacity, params, Encoding::PQ, quantizer.code_size()) {
+    if (quantizer.dim() != dim) {
+        throw std::invalid_argument("quantizer dim does not match index dim");
+    }
+    pq_ = std::make_unique<ProductQuantizer>(std::move(quantizer));
+}
+
+HnswIndex::HnswIndex(std::size_t dim, Metric metric, std::size_t capacity, HnswParams params,
+                     Encoding encoding, std::size_t code_size)
     : dim_(dim),
       stride_((dim + kFloatsPerCacheLine - 1) / kFloatsPerCacheLine * kFloatsPerCacheLine),
       metric_(metric),
@@ -94,6 +131,9 @@ HnswIndex::HnswIndex(std::size_t dim, Metric metric, std::size_t capacity, HnswP
       max_links_level0_(2 * params.M),
       level_factor_(1.0 / std::log(static_cast<double>(params.M))),
       distance_(distance_function(metric)),
+      kernels_(kernels_for(active_simd_level())),
+      encoding_(encoding),
+      code_size_(code_size),
       entry_(kNoEntry) {
     if (dim == 0) {
         throw std::invalid_argument("dim must be > 0");
@@ -104,7 +144,11 @@ HnswIndex::HnswIndex(std::size_t dim, Metric metric, std::size_t capacity, HnswP
     if (capacity == 0 || capacity >= std::numeric_limits<NodeId>::max()) {
         throw std::invalid_argument("capacity must be between 1 and 2^32 - 2");
     }
-    vectors_.resize(capacity * stride_);
+    if (encoding == Encoding::Float) {
+        vectors_.resize(capacity * stride_);
+    } else {
+        codes_.resize(capacity * code_size);
+    }
     level0_links_.assign(capacity * (1 + max_links_level0_), 0);
     upper_links_.resize(capacity);
     levels_.assign(capacity, 0);
@@ -113,6 +157,145 @@ HnswIndex::HnswIndex(std::size_t dim, Metric metric, std::size_t capacity, HnswP
 }
 
 HnswIndex::~HnswIndex() = default;
+
+class HnswIndex::FloatQuery {
+public:
+    FloatQuery(const HnswIndex& index, const float* query) : index_(index), query_(query) {}
+
+    float operator()(NodeId node) const {
+        return index_.distance_(query_, index_.vector_of(node), index_.dim_);
+    }
+
+private:
+    const HnswIndex& index_;
+    const float* query_;
+};
+
+class HnswIndex::Sq8Query {
+public:
+    Sq8Query(const HnswIndex& index, const float* query) : index_(index) {
+        if (index.metric_ == Metric::L2) {
+            index.sq_->prepare_l2(query, prepared_);
+        } else {
+            index.sq_->prepare_dot(query, prepared_);
+        }
+    }
+
+    float operator()(NodeId node) const {
+        const std::uint8_t* code = index_.code_of(node);
+        if (index_.metric_ == Metric::L2) {
+            return prepared_.constant + index_.kernels_.sq8_l2(prepared_.value.data(),
+                                                               prepared_.weight.data(), code,
+                                                               index_.dim_);
+        }
+        const float dot =
+            prepared_.constant + index_.kernels_.sq8_dot(prepared_.value.data(), code, index_.dim_);
+        return index_.metric_ == Metric::Cosine ? 1.0f - dot : -dot;
+    }
+
+private:
+    const HnswIndex& index_;
+    ScalarQuantizer::PreparedQuery prepared_;
+};
+
+// Builds the query's lookup table once; each node then costs m table reads.
+class HnswIndex::PqQuery {
+public:
+    PqQuery(const HnswIndex& index, const float* query)
+        : index_(index), table_(index.pq_->m() * ProductQuantizer::kCentroids) {
+        index.pq_->compute_table(query, index.metric_ != Metric::L2, table_.data());
+    }
+
+    float operator()(NodeId node) const {
+        const float sum = pq_table_sum(table_.data(), index_.code_of(node), index_.pq_->m());
+        switch (index_.metric_) {
+            case Metric::L2:
+                return sum;
+            case Metric::InnerProduct:
+                return -sum;
+            case Metric::Cosine:
+                return 1.0f - sum;
+        }
+        return sum;
+    }
+
+private:
+    const HnswIndex& index_;
+    std::vector<float> table_;
+};
+
+template <typename Fn>
+decltype(auto) HnswIndex::with_query(const float* query, Fn&& fn) const {
+    switch (encoding_) {
+        case Encoding::SQ8:
+            return fn(Sq8Query(*this, query));
+        case Encoding::PQ:
+            return fn(PqQuery(*this, query));
+        case Encoding::Float:
+            break;
+    }
+    return fn(FloatQuery(*this, query));
+}
+
+void HnswIndex::store(NodeId node, const float* vector) {
+    switch (encoding_) {
+        case Encoding::Float:
+            std::copy_n(vector, dim_, vector_of(node));
+            break;
+        case Encoding::SQ8:
+            sq_->encode(vector, code_of(node));
+            break;
+        case Encoding::PQ:
+            pq_->encode(vector, code_of(node));
+            break;
+    }
+}
+
+float HnswIndex::node_distance(NodeId a, NodeId b) const {
+    if (encoding_ == Encoding::Float) {
+        return distance_(vector_of(a), vector_of(b), dim_);
+    }
+    thread_local std::vector<float> va;
+    thread_local std::vector<float> vb;
+    va.resize(dim_);
+    vb.resize(dim_);
+    if (encoding_ == Encoding::SQ8) {
+        sq_->decode(code_of(a), va.data());
+        sq_->decode(code_of(b), vb.data());
+    } else {
+        pq_->decode(code_of(a), va.data());
+        pq_->decode(code_of(b), vb.data());
+    }
+    return distance_(va.data(), vb.data(), dim_);
+}
+
+bool HnswIndex::same_data(NodeId a, NodeId b) const {
+    if (encoding_ == Encoding::Float) {
+        return std::equal(vector_of(a), vector_of(a) + dim_, vector_of(b));
+    }
+    return std::equal(code_of(a), code_of(a) + code_size_, code_of(b));
+}
+
+void HnswIndex::prefetch_node(NodeId node) const noexcept {
+    if (encoding_ == Encoding::Float) {
+        prefetch(vector_of(node));
+        return;
+    }
+    __builtin_prefetch(code_of(node));
+    if (code_size_ > 64) {
+        __builtin_prefetch(code_of(node) + 64);
+    }
+}
+
+const float* HnswIndex::prepare_query(std::span<const float> query,
+                                      std::vector<float>& buffer) const {
+    if (metric_ != Metric::Cosine) {
+        return query.data();
+    }
+    buffer.assign(query.begin(), query.end());
+    normalize(buffer.data(), dim_);
+    return buffer.data();
+}
 
 HnswIndex::NodeId* HnswIndex::links(NodeId node, int level) noexcept {
     if (level == 0) {
@@ -158,18 +341,23 @@ void HnswIndex::add(std::span<const float> vectors, std::size_t threads) {
 }
 
 void HnswIndex::insert(NodeId node, const float* vector) {
-    float* own = vector_of(node);
-    std::copy_n(vector, dim_, own);
+    std::vector<float> own(vector, vector + dim_);
     if (metric_ == Metric::Cosine) {
-        normalize(own, dim_);
+        normalize(own.data(), dim_);
     }
+    store(node, own.data());
 
     const int level = random_level(node);
     levels_[node] = static_cast<std::uint8_t>(level);
     if (level > 0) {
         upper_links_[node].assign(static_cast<std::size_t>(level) * (1 + params_.M), 0);
     }
+    // Distances from the new vector use its full values, even when nodes are compressed.
+    with_query(own.data(), [&](const auto& distance) { link_node(node, level, distance); });
+}
 
+template <typename Query>
+void HnswIndex::link_node(NodeId node, int level, const Query& distance) {
     // Only a node that becomes the new top keeps this lock for its whole insert.
     std::unique_lock top_lock(entry_lock_);
     const std::uint64_t entry = entry_.load(std::memory_order_acquire);
@@ -184,9 +372,9 @@ void HnswIndex::insert(NodeId node, const float* vector) {
 
     // Walk down the layers above this node's level, one greedy step at a time.
     std::vector<NodeId> scratch;
-    Candidate current{distance_(own, vector_of(entry_node(entry)), dim_), entry_node(entry)};
+    Candidate current{distance(entry_node(entry)), entry_node(entry)};
     for (int l = top_level; l > level; --l) {
-        greedy_search(own, current, l, scratch);
+        greedy_search(distance, current, l, scratch);
     }
 
     // On each of this node's layers, find close nodes and link to them both ways.
@@ -194,7 +382,7 @@ void HnswIndex::insert(NodeId node, const float* vector) {
     std::vector<Candidate> start{current};
     for (int l = std::min(level, top_level); l >= 0; --l) {
         std::vector<Candidate> found =
-            search_layer(own, start, params_.ef_construction, l, *visited);
+            search_layer(distance, start, params_.ef_construction, l, *visited);
         // Another thread may already have linked to this node, so it can show up here.
         std::erase_if(found, [node](const Candidate& c) { return c.id == node; });
 
@@ -208,7 +396,7 @@ void HnswIndex::insert(NodeId node, const float* vector) {
                 const NodeId other = block[1 + i];
                 if (std::none_of(neighbors.begin(), neighbors.end(),
                                  [other](const Candidate& c) { return c.id == other; })) {
-                    neighbors.push_back({distance_(own, vector_of(other), dim_), other});
+                    neighbors.push_back({distance(other), other});
                 }
             }
             if (neighbors.size() > max_links(l)) {
@@ -231,20 +419,37 @@ void HnswIndex::insert(NodeId node, const float* vector) {
     }
 }
 
+template <typename Query>
+std::vector<HnswIndex::Candidate> HnswIndex::search_graph(const Query& distance,
+                                                          std::size_t ef) const {
+    const std::uint64_t entry = entry_.load(std::memory_order_acquire);
+    if (entry == kNoEntry) {
+        return {};
+    }
+    std::vector<NodeId> scratch;
+    Candidate current{distance(entry_node(entry)), entry_node(entry)};
+    for (int l = entry_level(entry); l > 0; --l) {
+        greedy_search(distance, current, l, scratch);
+    }
+    VisitedHandle visited(*visited_pool_);
+    return search_layer(distance, {current}, ef, 0, *visited);
+}
+
 void HnswIndex::copy_links(NodeId node, int level, std::vector<NodeId>& out) const {
     std::lock_guard lock(node_locks_[node]);
     const NodeId* block = links(node, level);
     out.assign(block + 1, block + 1 + block[0]);
 }
 
-void HnswIndex::greedy_search(const float* query, Candidate& current, int level,
+template <typename Query>
+void HnswIndex::greedy_search(const Query& distance, Candidate& current, int level,
                               std::vector<NodeId>& scratch) const {
     bool moved = true;
     while (moved) {
         moved = false;
         copy_links(current.id, level, scratch);
         for (NodeId n : scratch) {
-            const float d = distance_(query, vector_of(n), dim_);
+            const float d = distance(n);
             if (d < current.distance) {
                 current = {d, n};
                 moved = true;
@@ -253,7 +458,8 @@ void HnswIndex::greedy_search(const float* query, Candidate& current, int level,
     }
 }
 
-std::vector<HnswIndex::Candidate> HnswIndex::search_layer(const float* query,
+template <typename Query>
+std::vector<HnswIndex::Candidate> HnswIndex::search_layer(const Query& distance,
                                                           const std::vector<Candidate>& start,
                                                           std::size_t ef, int level,
                                                           VisitedList& visited) const {
@@ -291,11 +497,11 @@ std::vector<HnswIndex::Candidate> HnswIndex::search_layer(const float* query,
         for (NodeId n : neighbors) {
             if (!visited.check_and_mark(n)) {
                 fresh.push_back(n);
-                prefetch(vector_of(n));
+                prefetch_node(n);
             }
         }
         for (NodeId n : fresh) {
-            const float d = distance_(query, vector_of(n), dim_);
+            const float d = distance(n);
             if (best.size() < ef || d < best.front().distance) {
                 to_visit.push_back({d, n});
                 std::push_heap(to_visit.begin(), to_visit.end(), farther<Candidate>);
@@ -326,16 +532,14 @@ void HnswIndex::select_neighbors(std::vector<Candidate>& candidates, std::size_t
     std::vector<Candidate> copies;
     chosen.reserve(m);
     for (const Candidate& c : candidates) {
-        const float* v = vector_of(c.id);
         bool skip = false;
         bool is_copy = false;
         for (const Candidate& kept : chosen) {
-            const float* w = vector_of(kept.id);
-            if (std::equal(v, v + dim_, w)) {
+            if (same_data(c.id, kept.id)) {
                 is_copy = true;
                 break;
             }
-            if (distance_(v, w, dim_) < c.distance) {
+            if (node_distance(c.id, kept.id) < c.distance) {
                 skip = true;
                 break;
             }
@@ -376,7 +580,7 @@ void HnswIndex::connect(NodeId node, NodeId new_node, float distance, int level)
     candidates.push_back({distance, new_node});
     for (std::size_t i = 0; i < count; ++i) {
         const NodeId other = block[1 + i];
-        candidates.push_back({distance_(vector_of(node), vector_of(other), dim_), other});
+        candidates.push_back({node_distance(node, other), other});
     }
     std::sort(candidates.begin(), candidates.end(), closer<Candidate>);
     select_neighbors(candidates, max_links(level));
@@ -398,35 +602,59 @@ void HnswIndex::search(std::span<const float> query, std::size_t k, std::size_t 
         return;
     }
 
-    const float* q = query.data();
-    std::vector<float> normalized;
-    if (metric_ == Metric::Cosine) {
-        normalized.assign(query.begin(), query.end());
-        normalize(normalized.data(), dim_);
-        q = normalized.data();
+    std::vector<float> buffer;
+    const float* q = prepare_query(query, buffer);
+    const std::vector<Candidate> found = with_query(
+        q, [&](const auto& distance) { return search_graph(distance, std::max(ef_search, k)); });
+    write_results(found, k, ids, distances);
+}
+
+void HnswIndex::search_rerank(std::span<const float> query, std::size_t k, std::size_t ef_search,
+                              std::size_t rerank, const FullVectors& full, std::span<RowId> ids,
+                              std::span<float> distances) const {
+    if (query.size() != dim_) {
+        throw std::invalid_argument("query size does not match dim");
+    }
+    if (ids.size() < k || distances.size() < k) {
+        throw std::invalid_argument("output buffers are smaller than k");
+    }
+    if (full.data == nullptr || full.stride < dim_) {
+        throw std::invalid_argument("full vectors are missing or have a stride smaller than dim");
+    }
+    if (k == 0) {
+        return;
     }
 
-    std::vector<Candidate> found;
-    const std::uint64_t entry = entry_.load(std::memory_order_acquire);
-    if (entry != kNoEntry) {
-        std::vector<NodeId> scratch;
-        Candidate current{distance_(q, vector_of(entry_node(entry)), dim_), entry_node(entry)};
-        for (int l = entry_level(entry); l > 0; --l) {
-            greedy_search(q, current, l, scratch);
-        }
-        VisitedHandle visited(*visited_pool_);
-        found = search_layer(q, {current}, std::max(ef_search, k), 0, *visited);
+    std::vector<float> buffer;
+    const float* q = prepare_query(query, buffer);
+    const std::size_t keep = std::max(rerank, k);
+    std::vector<Candidate> found = with_query(
+        q, [&](const auto& distance) { return search_graph(distance, std::max(ef_search, keep)); });
+    if (found.size() > keep) {
+        found.resize(keep);
     }
 
-    for (std::size_t i = 0; i < k; ++i) {
-        if (i < found.size()) {
-            ids[i] = found[i].id;
-            distances[i] = found[i].distance;
-        } else {
-            ids[i] = kNoRow;
-            distances[i] = std::numeric_limits<float>::infinity();
+    // Exact distance to the original vector. Stored full vectors aren't normalized,
+    // so Cosine divides by the vector's length here.
+    for (Candidate& c : found) {
+        const float* row = full.data + static_cast<std::size_t>(c.id) * full.stride;
+        switch (metric_) {
+            case Metric::L2:
+                c.distance = kernels_.l2_squared(q, row, dim_);
+                break;
+            case Metric::InnerProduct:
+                c.distance = -kernels_.dot_product(q, row, dim_);
+                break;
+            case Metric::Cosine: {
+                const float length = std::sqrt(kernels_.dot_product(row, row, dim_));
+                c.distance =
+                    length == 0 ? 1.0f : 1.0f - kernels_.dot_product(q, row, dim_) / length;
+                break;
+            }
         }
     }
+    std::sort(found.begin(), found.end(), closer<Candidate>);
+    write_results(found, k, ids, distances);
 }
 
 void HnswIndex::search_batch(std::span<const float> queries, std::size_t k, std::size_t ef_search,
@@ -467,13 +695,16 @@ HnswStats HnswIndex::stats() const {
     if (s.size > 0) {
         s.avg_links_level0 = static_cast<double>(total_links0) / static_cast<double>(s.size);
     }
-    s.memory_bytes = vectors_.capacity() * sizeof(float) +
+    s.memory_bytes = vectors_.capacity() * sizeof(float) + codes_.capacity() +
                      (level0_links_.size() + upper_slots) * sizeof(NodeId) + levels_.size() +
                      capacity_ * (sizeof(std::mutex) + sizeof(std::vector<NodeId>));
     return s;
 }
 
 void HnswIndex::save(const std::string& path) const {
+    if (encoding_ != Encoding::Float) {
+        throw std::logic_error("save() only supports indexes that store full vectors");
+    }
     FilePtr f(std::fopen(path.c_str(), "wb"));
     if (!f) {
         throw std::runtime_error("cannot open '" + path + "' for writing");

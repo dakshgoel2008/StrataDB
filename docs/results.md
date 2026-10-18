@@ -53,3 +53,42 @@ Build time with 12 threads: StrataDB AVX2 102 s, hnswlib 114 s.
   about 15% as noise.
 - Prefetching neighbor vectors before computing their distances raised AVX2 throughput
   at ef 48 from about 10,300 to about 13,600 queries per second in single runs.
+
+## Compression and re-ranking, Cohere-1M
+
+`./build/release/bench/hnsw_bench --dataset cohere-1m --encoding sq8|pq --rerank ...`
+
+1M vectors, 768 dimensions, cosine, M = 16, ef_construction = 200, k = 10, 1,000
+queries, median of 3 runs. Quantizers are trained on 50,000 evenly spaced vectors.
+Re-ranking reads full vectors from the memory-mapped dataset file, so they are not part
+of the index memory.
+
+| Index | Bytes per vector | Index memory | Build (s) |
+|---|---|---|---|
+| Full floats | 3,072 | 3,121 MiB | 438 |
+| SQ8 | 768 (4x smaller) | 924 MiB | 269 |
+| PQ, 96 pieces | 96 (32x smaller) | 283 MiB | 349 |
+| PQ, 48 pieces | 48 (64x smaller) | 237 MiB | 261 |
+
+Index memory includes the graph links, which are not compressed.
+
+| Index | Re-rank depth | ef_search | recall@10 | Queries/s | p99 (us) |
+|---|---|---|---|---|---|
+| hnswlib, full floats | - | 96 | 0.961 | 2,144 | 643 |
+| StrataDB, full floats | - | 96 | 0.961 | 2,427 | 594 |
+| StrataDB, SQ8 | none | 96 | 0.954 | 2,786 | 550 |
+| StrataDB, SQ8 | 20 | 96 | 0.961 | 2,955 | 494 |
+| StrataDB, PQ 96 | none | 512 | 0.575 | 1,207 | 1,026 |
+| StrataDB, PQ 96 | 100 | 512 | 0.937 | 1,272 | 975 |
+| StrataDB, PQ 96 | 200 | 384 | 0.955 | 1,495 | 829 |
+| StrataDB, PQ 48 | 400 | 512 | 0.857 | 1,238 | 945 |
+
+### Notes
+
+- SQ8 keeps nearly all the accuracy and is faster than full floats, because each
+  distance reads a quarter of the memory. A re-rank depth of 20 gives back the rest.
+- PQ alone stops improving at about 0.57 recall no matter how wide the search, because
+  its compression error is larger than the gaps between close neighbors. Re-ranking is
+  what makes it usable: 200 re-scored candidates reach 0.955.
+- 64x PQ (48 pieces) does not reach 0.95 on this dataset even with 400 re-scored
+  candidates. 32x is the practical limit for plain PQ here.

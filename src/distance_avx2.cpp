@@ -1,9 +1,10 @@
-// Compiled with -mavx2 -mfma. Only <immintrin.h> and <cstddef> are included, so no
-// shared inline code gets AVX2 instructions that other files might pick up.
+// Compiled with -mavx2 -mfma. Only <immintrin.h> and plain C headers are included, so
+// no shared inline code gets AVX2 instructions that other files might pick up.
 
 #include <immintrin.h>
 
 #include <cstddef>
+#include <cstdint>
 
 #include "distance_kernels.h"
 
@@ -72,6 +73,57 @@ float dot_product_avx2(const float* a, const float* b, std::size_t dim) noexcept
     float total = sum8(_mm256_add_ps(_mm256_add_ps(s0, s1), _mm256_add_ps(s2, s3)));
     for (; i < dim; ++i) {
         total += a[i] * b[i];
+    }
+    return total;
+}
+
+namespace {
+
+// Loads 8 code bytes and turns them into 8 floats.
+inline __m256 load_codes(const std::uint8_t* code) {
+    const __m128i bytes = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(code));
+    return _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(bytes));
+}
+
+}  // namespace
+
+float sq8_l2_avx2(const float* value, const float* weight, const std::uint8_t* code,
+                  std::size_t dim) noexcept {
+    __m256 s0 = _mm256_setzero_ps();
+    __m256 s1 = _mm256_setzero_ps();
+    std::size_t i = 0;
+    for (; i + 16 <= dim; i += 16) {
+        const __m256 d0 = _mm256_sub_ps(_mm256_loadu_ps(value + i), load_codes(code + i));
+        const __m256 d1 = _mm256_sub_ps(_mm256_loadu_ps(value + i + 8), load_codes(code + i + 8));
+        s0 = _mm256_fmadd_ps(_mm256_mul_ps(d0, _mm256_loadu_ps(weight + i)), d0, s0);
+        s1 = _mm256_fmadd_ps(_mm256_mul_ps(d1, _mm256_loadu_ps(weight + i + 8)), d1, s1);
+    }
+    for (; i + 8 <= dim; i += 8) {
+        const __m256 d = _mm256_sub_ps(_mm256_loadu_ps(value + i), load_codes(code + i));
+        s0 = _mm256_fmadd_ps(_mm256_mul_ps(d, _mm256_loadu_ps(weight + i)), d, s0);
+    }
+    float total = sum8(_mm256_add_ps(s0, s1));
+    for (; i < dim; ++i) {
+        const float d = value[i] - static_cast<float>(code[i]);
+        total += weight[i] * d * d;
+    }
+    return total;
+}
+
+float sq8_dot_avx2(const float* value, const std::uint8_t* code, std::size_t dim) noexcept {
+    __m256 s0 = _mm256_setzero_ps();
+    __m256 s1 = _mm256_setzero_ps();
+    std::size_t i = 0;
+    for (; i + 16 <= dim; i += 16) {
+        s0 = _mm256_fmadd_ps(_mm256_loadu_ps(value + i), load_codes(code + i), s0);
+        s1 = _mm256_fmadd_ps(_mm256_loadu_ps(value + i + 8), load_codes(code + i + 8), s1);
+    }
+    for (; i + 8 <= dim; i += 8) {
+        s0 = _mm256_fmadd_ps(_mm256_loadu_ps(value + i), load_codes(code + i), s0);
+    }
+    float total = sum8(_mm256_add_ps(s0, s1));
+    for (; i < dim; ++i) {
+        total += value[i] * static_cast<float>(code[i]);
     }
     return total;
 }

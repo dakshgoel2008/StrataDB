@@ -43,10 +43,19 @@ void set_simd_level(SimdLevel level);
 
 using KernelFn = float (*)(const float* a, const float* b, std::size_t dim);
 
-// The raw squared-L2 and dot-product functions for one level. Throws if unsupported.
+// Distances between a prepared query and an SQ8 code (see ScalarQuantizer::PreparedQuery).
+//   sq8_l2:  sum of weight[i] * (value[i] - code[i])^2
+//   sq8_dot: sum of value[i] * code[i]
+using Sq8L2Fn = float (*)(const float* value, const float* weight, const std::uint8_t* code,
+                          std::size_t dim);
+using Sq8DotFn = float (*)(const float* value, const std::uint8_t* code, std::size_t dim);
+
+// The raw distance functions for one level. Throws if unsupported.
 struct Kernels {
     KernelFn l2_squared;
     KernelFn dot_product;
+    Sq8L2Fn sq8_l2;
+    Sq8DotFn sq8_dot;
 };
 Kernels kernels_for(SimdLevel level);
 

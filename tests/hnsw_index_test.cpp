@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <filesystem>
 #include <fstream>
@@ -11,7 +12,9 @@
 #include <thread>
 #include <vector>
 
+#include "strata/distance.h"
 #include "strata/flat_index.h"
+#include "strata/quantizer.h"
 
 using strata::FlatIndex;
 using strata::HnswIndex;
@@ -277,4 +280,116 @@ TEST(HnswIndex, LoadRejectsDamagedFiles) {
 
     std::filesystem::remove(junk);
     std::filesystem::remove(full);
+}
+
+namespace {
+
+std::vector<float> normalized_copy(std::vector<float> data, std::size_t dim) {
+    for (std::size_t i = 0; i < data.size() / dim; ++i) {
+        strata::normalize(data.data() + i * dim, dim);
+    }
+    return data;
+}
+
+// Recall of search_rerank against exact results.
+double rerank_recall(const HnswIndex& index, const std::vector<float>& base,
+                     const std::vector<float>& queries, std::size_t k, std::size_t ef,
+                     std::size_t rerank) {
+    const std::size_t dim = index.dim();
+    FlatIndex flat(dim, index.metric());
+    flat.add(base);
+    const strata::FullVectors full{base.data(), dim};
+    std::size_t hits = 0;
+    const std::size_t nq = queries.size() / dim;
+    for (std::size_t q = 0; q < nq; ++q) {
+        const auto query = row(queries, q, dim);
+        std::vector<RowId> exact(k), approx(k);
+        std::vector<float> d1(k), d2(k);
+        flat.search(query, k, exact, d1);
+        index.search_rerank(query, k, ef, rerank, full, approx, d2);
+        for (RowId id : approx) {
+            hits += std::find(exact.begin(), exact.end(), id) != exact.end();
+        }
+    }
+    return static_cast<double>(hits) / static_cast<double>(nq * k);
+}
+
+}  // namespace
+
+TEST(HnswIndex, Sq8StoresOneBytePerValue) {
+    constexpr std::size_t kDim = 24;
+    const auto base = random_vectors(3000, kDim, 20);
+    const auto queries = random_vectors(100, kDim, 21);
+    HnswIndex index(kDim, Metric::L2, 3000, HnswParams{},
+                    strata::ScalarQuantizer::train(base, kDim));
+    index.add(base, 4);
+    EXPECT_EQ(index.encoding(), strata::Encoding::SQ8);
+    EXPECT_EQ(index.bytes_per_vector(), kDim);
+    EXPECT_GE(recall(index, base, queries, 10, 100), 0.85);
+    EXPECT_GE(rerank_recall(index, base, queries, 10, 100, 40), 0.95);
+}
+
+TEST(HnswIndex, PqWithRerankingRecoversAccuracy) {
+    constexpr std::size_t kDim = 32;
+    const auto base = random_vectors(4000, kDim, 22);
+    const auto queries = random_vectors(100, kDim, 23);
+    HnswIndex index(kDim, Metric::L2, 4000, HnswParams{},
+                    strata::ProductQuantizer::train(base, kDim, {8, 15, 1, 0}));
+    index.add(base, 4);
+    EXPECT_EQ(index.bytes_per_vector(), 8u);  // 128 bytes of floats -> 8 bytes
+
+    const double plain = recall(index, base, queries, 10, 100);
+    const double reranked = rerank_recall(index, base, queries, 10, 200, 100);
+    EXPECT_GT(reranked, plain + 0.1);
+    EXPECT_GE(reranked, 0.9);
+}
+
+TEST(HnswIndex, CompressedCosineWorks) {
+    constexpr std::size_t kDim = 32;
+    const auto base = random_vectors(3000, kDim, 24);
+    const auto queries = random_vectors(50, kDim, 25);
+    // Quantizers are trained on normalized vectors, since that's what a Cosine index stores.
+    const auto sample = normalized_copy(base, kDim);
+    HnswIndex sq8(kDim, Metric::Cosine, 3000, HnswParams{},
+                  strata::ScalarQuantizer::train(sample, kDim));
+    HnswIndex pq(kDim, Metric::Cosine, 3000, HnswParams{},
+                 strata::ProductQuantizer::train(sample, kDim, {16, 15, 1, 0}));
+    sq8.add(base, 4);
+    pq.add(base, 4);
+    EXPECT_GE(rerank_recall(sq8, base, queries, 10, 100, 40), 0.95);
+    EXPECT_GE(rerank_recall(pq, base, queries, 10, 200, 100), 0.9);
+}
+
+TEST(HnswIndex, RerankGivesExactDistances) {
+    constexpr std::size_t kDim = 16;
+    const auto base = random_vectors(500, kDim, 26);
+    HnswIndex index(kDim, Metric::InnerProduct, 500, HnswParams{},
+                    strata::ScalarQuantizer::train(base, kDim));
+    index.add(base);
+    const auto query = row(random_vectors(1, kDim, 27), 0, kDim);
+    std::vector<RowId> ids(5);
+    std::vector<float> dist(5);
+    index.search_rerank(query, 5, 50, 20, {base.data(), kDim}, ids, dist);
+    for (std::size_t i = 0; i < 5; ++i) {
+        const auto v = row(base, static_cast<std::size_t>(ids[i]), kDim);
+        EXPECT_FLOAT_EQ(dist[i], -strata::dot_product(query.data(), v.data(), kDim));
+    }
+    EXPECT_TRUE(std::is_sorted(dist.begin(), dist.end()));
+}
+
+TEST(HnswIndex, CompressedIndexRejectsBadUse) {
+    constexpr std::size_t kDim = 8;
+    const auto base = random_vectors(300, kDim, 28);
+    const auto sq = strata::ScalarQuantizer::train(base, kDim);
+    EXPECT_THROW(HnswIndex(16, Metric::L2, 10, HnswParams{}, sq), std::invalid_argument);
+
+    HnswIndex index(kDim, Metric::L2, 300, HnswParams{}, sq);
+    index.add(base);
+    const auto path = (std::filesystem::temp_directory_path() / "strata_sq8.bin").string();
+    EXPECT_THROW(index.save(path), std::logic_error);
+
+    std::vector<RowId> ids(3);
+    std::vector<float> dist(3);
+    EXPECT_THROW(index.search_rerank(row(base, 0, kDim), 3, 10, 10, {}, ids, dist),
+                 std::invalid_argument);
 }

@@ -26,26 +26,33 @@ float cosine_distance(const float* a, const float* b, std::size_t dim) {
     return 1.0f - Dot(a, b, dim);
 }
 
-// Everything distance_function() can hand out for one SIMD level.
+// Everything distance_function() and kernels_for() can hand out for one SIMD level.
 struct LevelFunctions {
     KernelFn l2;
     KernelFn dot;
     DistanceFn inner_product;
     DistanceFn cosine;
+    Sq8L2Fn sq8_l2;
+    Sq8DotFn sq8_dot;
 };
 
-template <KernelFn L2, KernelFn Dot>
+template <KernelFn L2, KernelFn Dot, Sq8L2Fn SqL2, Sq8DotFn SqDot>
 constexpr LevelFunctions make_level() {
-    return {L2, Dot, inner_product_distance<Dot>, cosine_distance<Dot>};
+    return {L2, Dot, inner_product_distance<Dot>, cosine_distance<Dot>, SqL2, SqDot};
 }
 
-constexpr LevelFunctions kScalar = make_level<l2_squared, dot_product>();
+constexpr LevelFunctions kScalar =
+    make_level<l2_squared, dot_product, kernels::sq8_l2_scalar, kernels::sq8_dot_scalar>();
 #if defined(STRATA_X86_KERNELS)
+// SQ8 has no separate compiler-vectorized or AVX-512 version; those levels reuse others.
 constexpr LevelFunctions kAutoVec =
-    make_level<kernels::l2_squared_autovec, kernels::dot_product_autovec>();
-constexpr LevelFunctions kAvx2 = make_level<kernels::l2_squared_avx2, kernels::dot_product_avx2>();
+    make_level<kernels::l2_squared_autovec, kernels::dot_product_autovec, kernels::sq8_l2_scalar,
+               kernels::sq8_dot_scalar>();
+constexpr LevelFunctions kAvx2 = make_level<kernels::l2_squared_avx2, kernels::dot_product_avx2,
+                                            kernels::sq8_l2_avx2, kernels::sq8_dot_avx2>();
 constexpr LevelFunctions kAvx512 =
-    make_level<kernels::l2_squared_avx512, kernels::dot_product_avx512>();
+    make_level<kernels::l2_squared_avx512, kernels::dot_product_avx512, kernels::sq8_l2_avx2,
+               kernels::sq8_dot_avx2>();
 #endif
 
 const LevelFunctions& functions(SimdLevel level) noexcept {
@@ -150,6 +157,28 @@ float dot_product(const float* a, const float* b, std::size_t dim) noexcept {
     return (s0 + s1) + (s2 + s3);
 }
 
+namespace kernels {
+
+float sq8_l2_scalar(const float* value, const float* weight, const std::uint8_t* code,
+                    std::size_t dim) noexcept {
+    float sum = 0;
+    for (std::size_t i = 0; i < dim; ++i) {
+        const float d = value[i] - static_cast<float>(code[i]);
+        sum += weight[i] * d * d;
+    }
+    return sum;
+}
+
+float sq8_dot_scalar(const float* value, const std::uint8_t* code, std::size_t dim) noexcept {
+    float sum = 0;
+    for (std::size_t i = 0; i < dim; ++i) {
+        sum += value[i] * static_cast<float>(code[i]);
+    }
+    return sum;
+}
+
+}  // namespace kernels
+
 void normalize(float* v, std::size_t dim) noexcept {
     // Add up in double so long vectors don't lose precision.
     double squares = 0;
@@ -216,7 +245,7 @@ Kernels kernels_for(SimdLevel level) {
                                     "' is not supported on this machine");
     }
     const LevelFunctions& f = functions(level);
-    return {f.l2, f.dot};
+    return {f.l2, f.dot, f.sq8_l2, f.sq8_dot};
 }
 
 DistanceFn distance_function(Metric metric) noexcept {
