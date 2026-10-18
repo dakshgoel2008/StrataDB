@@ -86,6 +86,20 @@ TEST_F(VecsIoTest, MaxRowsReadsPrefix) {
     EXPECT_EQ(sb::read_fvecs(path("a.fvecs"), 100).rows, 10u);
 }
 
+TEST_F(VecsIoTest, FirstRowReadsFromTheMiddle) {
+    const auto m = make_float_matrix(10, 2);
+    sb::write_fvecs(path("a.fvecs"), m);
+
+    const auto part = sb::read_fvecs(path("a.fvecs"), 3, 4);  // rows 4, 5, 6
+    ASSERT_EQ(part.rows, 3u);
+    EXPECT_EQ(part.data, std::vector<float>(m.data.begin() + 8, m.data.begin() + 14));
+
+    // Near the end only the remaining rows come back; past the end, none.
+    EXPECT_EQ(sb::read_fvecs(path("a.fvecs"), 5, 8).rows, 2u);
+    EXPECT_EQ(sb::read_fvecs(path("a.fvecs"), 0, 7).rows, 3u);
+    EXPECT_EQ(sb::read_fvecs(path("a.fvecs"), 0, 20).rows, 0u);
+}
+
 TEST_F(VecsIoTest, BvecsAreWidenedToFloat) {
     // One row, dim=4, bytes {0, 1, 200, 255}.
     const std::string p = path("a.bvecs");

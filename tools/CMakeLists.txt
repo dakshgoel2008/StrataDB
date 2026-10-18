@@ -1,2 +1,5 @@
 add_executable(vecs_info vecs_info.cpp)
 target_link_libraries(vecs_info PRIVATE strata_bench_common strata_warnings)
+
+add_executable(compute_groundtruth compute_groundtruth.cpp)
+target_link_libraries(compute_groundtruth PRIVATE strata strata_bench_common strata_warnings)

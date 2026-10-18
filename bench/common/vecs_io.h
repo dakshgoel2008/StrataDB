@@ -31,10 +31,14 @@ struct VecsShape {
 // value_bytes is 4 for fvecs/ivecs and 1 for bvecs.
 VecsShape inspect_vecs(const std::string& path, std::size_t value_bytes);
 
-// Reads up to max_rows rows (0 means all). Throws if the file is broken.
-Matrix<float> read_fvecs(const std::string& path, std::size_t max_rows = 0);
-Matrix<std::int32_t> read_ivecs(const std::string& path, std::size_t max_rows = 0);
-Matrix<float> read_bvecs(const std::string& path, std::size_t max_rows = 0);  // bytes become floats
+// Reads up to max_rows rows (0 means all) starting at first_row.
+// Throws if the file is broken. bvecs bytes are turned into floats.
+Matrix<float> read_fvecs(const std::string& path, std::size_t max_rows = 0,
+                         std::size_t first_row = 0);
+Matrix<std::int32_t> read_ivecs(const std::string& path, std::size_t max_rows = 0,
+                                std::size_t first_row = 0);
+Matrix<float> read_bvecs(const std::string& path, std::size_t max_rows = 0,
+                         std::size_t first_row = 0);
 
 void write_fvecs(const std::string& path, const Matrix<float>& m);
 void write_ivecs(const std::string& path, const Matrix<std::int32_t>& m);

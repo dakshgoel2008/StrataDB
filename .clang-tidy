@@ -1,0 +1,13 @@
+Checks: >
+  bugprone-*,
+  performance-*,
+  modernize-use-nullptr,
+  modernize-use-override,
+  modernize-use-emplace,
+  readability-braces-around-statements,
+  readability-container-size-empty,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-narrowing-conversions,
+  -bugprone-random-generator-seed
+WarningsAsErrors: ''
+HeaderFilterRegex: '(include|src|bench|tools)/.*'

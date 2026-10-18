@@ -1,5 +1,8 @@
 add_executable(strata_tests
   smoke_test.cpp
+  aligned_buffer_test.cpp
+  distance_test.cpp
+  flat_index_test.cpp
   bench_common/vecs_io_test.cpp
   bench_common/metrics_test.cpp
 )
