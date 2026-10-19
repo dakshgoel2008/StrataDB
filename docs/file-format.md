@@ -1,7 +1,6 @@
 # File format
 
-All numbers are little-endian. Every checksum is CRC32C (the Castagnoli
-polynomial, the same one ext4 and RocksDB use). Code: [wal.cpp](../src/wal.cpp),
+Little-endian. Checksums are CRC32C. Code: [wal.cpp](../src/wal.cpp),
 [snapshot.cpp](../src/snapshot.cpp), [database.cpp](../src/database.cpp).
 
 ## Database directory
@@ -14,7 +13,7 @@ polynomial, the same one ext4 and RocksDB use). Code: [wal.cpp](../src/wal.cpp),
 | `LOCK` | locked with `flock` while a program has the database open |
 | `*.tmp` | a file being written; removed when the database is opened |
 
-Log records are numbered 1, 2, 3, ... This number is the LSN (log sequence number).
+LSN: log sequence number, starting at 1.
 
 ## Log record
 
@@ -27,9 +26,8 @@ offset  size  field
 17      n     payload
 ```
 
-A log file is records back to back with nothing else. A reader stops at the
-first record that is cut off, fails its CRC, or has the wrong lsn (each record
-must be exactly one more than the one before).
+A log file is records back to back. Reading stops at the first record that is
+cut off, fails its CRC, or whose lsn is not previous + 1.
 
 ### Insert payload
 
@@ -38,10 +36,10 @@ offset  size            field
 0       8               row id of the first vector
 8       4               number of vectors (count)
 12      4               dim
-16      count*dim*4     the vectors, as float32, exactly as the caller passed them
+16      count*dim*4     vectors, float32, as passed by the caller
 ```
 
-Inserts larger than about 4 MiB are split into several records.
+Inserts over about 4 MiB are split into several records.
 
 ## Snapshot file
 
@@ -81,12 +79,10 @@ offset  size  field
 | 3 | layer-0 links | count * (1 + 2M) * 4 | per node: link count, then 2M u32 slots |
 | 4 | upper links | (sum of levels) * (1 + M) * 4 | per node with level > 0, layers 1 to level: link count, then M slots |
 
-Unused link slots are zero. For cosine, the stored vectors are already normalized.
+Unused link slots are zero. Cosine vectors are stored normalized.
 
-Loading checks the header CRC, each section's CRC, that the section table matches
-the sizes the header calls for, that the file has no extra bytes, and that every
-link points to an existing node on a high enough layer. A damaged file is
-refused, never half-loaded.
+Load checks: header CRC, section CRCs, section sizes, file size, and every link
+(target exists and is on a high enough layer). Any failure rejects the file.
 
 ## MANIFEST
 
@@ -103,31 +99,27 @@ offset  size  field
 
 ## Writing a file safely
 
-A snapshot or MANIFEST is never written in place:
+Snapshots and the MANIFEST:
 
-1. write `name.tmp` and `fdatasync` it;
-2. `rename` it to `name` (replacing the old file all at once);
-3. `fsync` the directory, so the rename itself survives a system crash.
+1. write `name.tmp`, `fdatasync`;
+2. `rename` to `name`;
+3. `fsync` the directory.
 
-A new log file is created, then the directory is synced, before any record goes into it.
+New log files: create, `fsync` the directory, then write records.
 
 ## Checkpoint
 
-1. Wait for running inserts to finish, note the last lsn L, and start a new log
-   file at L + 1. New inserts go on from here.
-2. Write the snapshot of every row up to L, safely as above.
-3. Write a MANIFEST that names the new snapshot and L, safely as above.
-4. Delete the old snapshot and the log files that only hold records up to L.
+1. Wait for in-flight inserts, record the last lsn L, start a new log file at L + 1.
+2. Write the snapshot of all rows up to L.
+3. Write the MANIFEST naming the new snapshot and L.
+4. Delete the old snapshot and log files with records only up to L.
 
-A crash at any step leaves either the old MANIFEST (old snapshot plus the whole
-log, all still there) or the new one (new snapshot plus the log after L).
+A crash at any step leaves a valid old or new MANIFEST with all files it needs.
 
 ## Opening (recovery)
 
-1. Read the MANIFEST. Delete `*.tmp` files and snapshots it doesn't name.
-2. Load the snapshot and check that its lsn matches the MANIFEST.
-3. Replay the log in order, skipping records up to the snapshot's lsn.
-4. If the newest log file ends in a cut-off or damaged record, cut the file there.
-   That record was never acknowledged (or, with sync mode `none`, was lost in a
-   system crash, which that mode allows). Damage anywhere else, or a missing log
-   file, stops the open with an error instead of silently losing data.
+1. Read the MANIFEST; delete `*.tmp` files and snapshots it doesn't name.
+2. Load the snapshot; its lsn must match the MANIFEST.
+3. Replay log records after that lsn, in order.
+4. A cut-off or damaged record at the end of the newest log file is truncated.
+   Damage anywhere else, or a missing log file, is an error.
