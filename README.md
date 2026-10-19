@@ -7,8 +7,6 @@ baselines.
 
 ## Results
 
-Single-thread search, Intel i5-1235U (AVX2). Full tables: [docs/results.md](docs/results.md).
-
 | | |
 |---|---|
 | HNSW, SIFT-1M | 12,807 queries/s at recall@10 = 0.943 (hnswlib: 10,582) |
@@ -34,7 +32,6 @@ Single-thread search, Intel i5-1235U (AVX2). Full tables: [docs/results.md](docs
 - **Storage**: write-ahead log with group commit, CRC32C-checked snapshots, atomic
   file replacement, MANIFEST, recovery.
 
-Design choices: [docs/design.md](docs/design.md). On-disk format: [docs/file-format.md](docs/file-format.md).
 
 ## Build
 
@@ -45,8 +42,6 @@ cmake --preset release
 cmake --build --preset release
 ctest --preset release
 ```
-
-Presets: `release`, `debug`, `asan`, `tsan`, `fuzz` (clang).
 
 ## Usage
 
@@ -65,23 +60,3 @@ db->search(query, 10, 64, ids, distances);  // k = 10, ef_search = 64
 db->checkpoint();                           // snapshot + drop covered log
 auto reopened = strata::Database::open("my-db");
 ```
-
-## Reproduce
-
-```bash
-bench/run_all.sh        # all benchmarks, crash test, fuzzing
-bench/run_all.sh sift   # SIFT-1M only
-```
-
-Hardware and run rules: [bench/hardware.md](bench/hardware.md).
-
-## Layout
-
-| Path | Contents |
-|---|---|
-| `include/strata/`, `src/` | engine |
-| `tests/` | GoogleTest unit and concurrency tests |
-| `bench/` | benchmarks, dataset scripts, plots |
-| `tools/` | ground-truth generator, crash tester, vector file inspector |
-| `fuzz/` | libFuzzer targets |
-| `docs/` | results, design, file format |
