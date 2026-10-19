@@ -7,7 +7,9 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <memory>
 #include <random>
+#include <span>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -385,11 +387,80 @@ TEST(HnswIndex, CompressedIndexRejectsBadUse) {
 
     HnswIndex index(kDim, Metric::L2, 300, HnswParams{}, sq);
     index.add(base);
-    const auto path = (std::filesystem::temp_directory_path() / "strata_sq8.bin").string();
-    EXPECT_THROW(index.save(path), std::logic_error);
 
     std::vector<RowId> ids(3);
     std::vector<float> dist(3);
     EXPECT_THROW(index.search_rerank(row(base, 0, kDim), 3, 10, 10, {}, ids, dist),
+                 std::invalid_argument);
+}
+
+TEST(HnswIndex, CompressedIndexesSaveAndLoad) {
+    constexpr std::size_t kDim = 16;
+    const auto base = random_vectors(1000, kDim, 29);
+    const auto queries = random_vectors(20, kDim, 30);
+    std::vector<std::unique_ptr<HnswIndex>> indexes;
+    indexes.push_back(std::make_unique<HnswIndex>(kDim, Metric::L2, 1000, HnswParams{},
+                                                  strata::ScalarQuantizer::train(base, kDim)));
+    indexes.push_back(
+        std::make_unique<HnswIndex>(kDim, Metric::InnerProduct, 1000, HnswParams{},
+                                    strata::ProductQuantizer::train(base, kDim, {4, 10, 1, 0})));
+
+    const auto path = (std::filesystem::temp_directory_path() / "strata_compressed.snap").string();
+    for (const auto& index : indexes) {
+        index->add(base, 4);
+        index->save(path);
+        const auto loaded = HnswIndex::load(path);
+        EXPECT_EQ(loaded->encoding(), index->encoding());
+        EXPECT_EQ(loaded->capacity(), 1000u);
+
+        std::vector<RowId> a(200), b(200);
+        std::vector<float> da(200), db(200);
+        index->search_batch(queries, 10, 50, a, da);
+        loaded->search_batch(queries, 10, 50, b, db);
+        EXPECT_EQ(a, b);
+        EXPECT_EQ(da, db);
+
+        std::vector<float> v1(kDim), v2(kDim);
+        index->get_vector(123, v1);
+        loaded->get_vector(123, v2);
+        EXPECT_EQ(v1, v2);
+    }
+    std::filesystem::remove(path);
+}
+
+TEST(HnswIndex, GetVectorReturnsStoredValues) {
+    constexpr std::size_t kDim = 6;
+    const auto base = random_vectors(50, kDim, 31);
+    HnswIndex l2(kDim, Metric::L2, 50);
+    HnswIndex cosine(kDim, Metric::Cosine, 50);
+    l2.add(base);
+    cosine.add(base);
+    std::vector<float> out(kDim);
+    l2.get_vector(7, out);
+    EXPECT_EQ(out, row(base, 7, kDim));
+    cosine.get_vector(7, out);
+    auto expected = row(base, 7, kDim);
+    strata::normalize(expected.data(), kDim);
+    for (std::size_t i = 0; i < kDim; ++i) {
+        EXPECT_FLOAT_EQ(out[i], expected[i]);
+    }
+    EXPECT_THROW(l2.get_vector(50, out), std::invalid_argument);
+}
+
+TEST(HnswIndex, ReserveThenInsert) {
+    constexpr std::size_t kDim = 8;
+    const auto base = random_vectors(200, kDim, 32);
+    HnswIndex index(kDim, Metric::L2, 200);
+    const RowId first = index.reserve(100);
+    const RowId second = index.reserve(100);
+    EXPECT_EQ(first, 0);
+    EXPECT_EQ(second, 100);
+    // Filling the second block first must still give every row its own vector.
+    index.insert_reserved(second, std::span(base).subspan(100 * kDim));
+    index.insert_reserved(first, std::span(base).subspan(0, 100 * kDim));
+    const auto r = search(index, row(base, 150, kDim), 1);
+    EXPECT_EQ(r.ids[0], 150);
+    EXPECT_THROW(index.reserve(1), std::length_error);
+    EXPECT_THROW(index.insert_reserved(150, std::span(base).subspan(0, 100 * kDim)),
                  std::invalid_argument);
 }

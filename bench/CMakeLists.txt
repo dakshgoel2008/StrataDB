@@ -35,3 +35,6 @@ FetchContent_MakeAvailable(googlebenchmark)
 
 add_executable(distance_bench distance_bench.cpp)
 target_link_libraries(distance_bench PRIVATE strata benchmark::benchmark strata_warnings)
+
+add_executable(durability_bench durability_bench.cpp)
+target_link_libraries(durability_bench PRIVATE strata strata_bench_common strata_warnings)

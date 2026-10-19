@@ -16,6 +16,8 @@ public:
 
     // sample holds rows of dim floats.
     static ScalarQuantizer train(std::span<const float> sample, std::size_t dim);
+    // Rebuilds a trained quantizer from its saved ranges.
+    static ScalarQuantizer from_ranges(std::vector<float> mins, std::vector<float> scales);
 
     std::size_t dim() const noexcept { return dim_; }
     std::size_t code_size() const noexcept { return dim_; }
@@ -63,6 +65,9 @@ public:
     // sample holds rows of dim floats; needs at least 256 rows.
     static ProductQuantizer train(std::span<const float> sample, std::size_t dim,
                                   const TrainOptions& options);
+    // Rebuilds a trained quantizer from its saved centroids (256 * dim floats).
+    static ProductQuantizer from_centroids(std::size_t dim, std::size_t m,
+                                           std::vector<float> centroids);
 
     std::size_t dim() const noexcept { return dim_; }
     std::size_t m() const noexcept { return m_; }
@@ -82,6 +87,7 @@ public:
     const float* centroids(std::size_t piece) const noexcept {
         return centroids_.data() + piece * kCentroids * sub_dim_;
     }
+    const std::vector<float>& all_centroids() const noexcept { return centroids_; }
 
 private:
     std::size_t dim_ = 0;

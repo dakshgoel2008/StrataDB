@@ -5,6 +5,11 @@ add_executable(strata_tests
   flat_index_test.cpp
   hnsw_index_test.cpp
   quantizer_test.cpp
+  crc32c_test.cpp
+  file_system_test.cpp
+  wal_test.cpp
+  snapshot_test.cpp
+  database_test.cpp
   bench_common/vecs_io_test.cpp
   bench_common/metrics_test.cpp
 )

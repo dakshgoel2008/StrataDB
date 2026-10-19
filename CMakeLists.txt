@@ -14,6 +14,7 @@ endif()
 
 option(STRATA_BUILD_TESTS "Build unit tests" ON)
 option(STRATA_WERROR "Treat compiler warnings as errors" OFF)
+option(STRATA_BUILD_FUZZERS "Build libFuzzer targets (needs clang)" OFF)
 set(STRATA_SANITIZE "" CACHE STRING "Bug-finding checks to enable, e.g. 'address,undefined' or 'thread'")
 
 # Bug-finding checks must cover every file, including the test library.
@@ -21,6 +22,16 @@ if(STRATA_SANITIZE)
   add_compile_options(-fsanitize=${STRATA_SANITIZE} -fno-sanitize-recover=all
                       -fno-omit-frame-pointer -g)
   add_link_options(-fsanitize=${STRATA_SANITIZE})
+endif()
+
+# Fuzzing: every file gets coverage hooks for libFuzzer, and checksum checks are
+# skipped so the fuzzer can reach the code behind them.
+if(STRATA_BUILD_FUZZERS)
+  if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    message(FATAL_ERROR "STRATA_BUILD_FUZZERS needs clang")
+  endif()
+  add_compile_options(-fsanitize=fuzzer-no-link)
+  add_compile_definitions(FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION)
 endif()
 
 # Strict warnings, applied only to our own code.
@@ -36,6 +47,9 @@ endif()
 add_subdirectory(src)    # the database engine
 add_subdirectory(bench)  # dataset reading and measurement helpers
 add_subdirectory(tools)  # small command-line programs
+if(STRATA_BUILD_FUZZERS)
+  add_subdirectory(fuzz)
+endif()
 
 if(STRATA_BUILD_TESTS)
   enable_testing()

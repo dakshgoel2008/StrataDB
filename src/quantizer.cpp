@@ -71,6 +71,17 @@ ScalarQuantizer ScalarQuantizer::train(std::span<const float> sample, std::size_
     return sq;
 }
 
+ScalarQuantizer ScalarQuantizer::from_ranges(std::vector<float> mins, std::vector<float> scales) {
+    if (mins.empty() || mins.size() != scales.size()) {
+        throw std::invalid_argument("SQ8 ranges need one min and one scale per dimension");
+    }
+    ScalarQuantizer sq;
+    sq.dim_ = mins.size();
+    sq.min_ = std::move(mins);
+    sq.scale_ = std::move(scales);
+    return sq;
+}
+
 void ScalarQuantizer::encode(const float* vector, std::uint8_t* code) const noexcept {
     for (std::size_t i = 0; i < dim_; ++i) {
         if (scale_[i] == 0) {
@@ -232,6 +243,19 @@ ProductQuantizer ProductQuantizer::train(std::span<const float> sample, std::siz
                       pq.centroids_.begin() + static_cast<long>(piece * kCentroids * pq.sub_dim_));
         },
         1);
+    return pq;
+}
+
+ProductQuantizer ProductQuantizer::from_centroids(std::size_t dim, std::size_t m,
+                                                  std::vector<float> centroids) {
+    if (dim == 0 || m == 0 || dim % m != 0 || centroids.size() != kCentroids * dim) {
+        throw std::invalid_argument("PQ centroids don't match dim and m");
+    }
+    ProductQuantizer pq;
+    pq.dim_ = dim;
+    pq.m_ = m;
+    pq.sub_dim_ = dim / m;
+    pq.centroids_ = std::move(centroids);
     return pq;
 }
 

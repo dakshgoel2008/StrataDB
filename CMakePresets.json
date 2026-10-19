@@ -37,6 +37,17 @@
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
         "STRATA_SANITIZE": "thread"
       }
+    },
+    {
+      "name": "fuzz",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_CXX_COMPILER": "clang++",
+        "STRATA_SANITIZE": "address,undefined",
+        "STRATA_BUILD_FUZZERS": "ON",
+        "STRATA_BUILD_TESTS": "OFF"
+      }
     }
   ],
   "buildPresets": [
@@ -44,7 +55,8 @@
     { "name": "release", "configurePreset": "release" },
     { "name": "profile", "configurePreset": "profile" },
     { "name": "asan", "configurePreset": "asan" },
-    { "name": "tsan", "configurePreset": "tsan" }
+    { "name": "tsan", "configurePreset": "tsan" },
+    { "name": "fuzz", "configurePreset": "fuzz" }
   ],
   "testPresets": [
     { "name": "debug", "configurePreset": "debug", "output": { "outputOnFailure": true } },

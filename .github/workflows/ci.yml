@@ -36,3 +36,27 @@ jobs:
 
       - name: Test
         run: ctest --preset ${{ matrix.preset }}
+
+      - name: Crash test (kill -9)
+        if: matrix.preset == 'release'
+        run: ./build/release/tools/crashtest --iterations 300 --dir crashtest-runs/db
+
+  fuzz:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build clang-18 libclang-rt-18-dev
+
+      - name: Build fuzzers
+        run: |
+          cmake --preset fuzz -DCMAKE_CXX_COMPILER=clang++-18 -DSTRATA_WERROR=ON
+          cmake --build --preset fuzz --target wal_fuzz snapshot_fuzz make_seeds
+
+      - name: Fuzz for 2 minutes each
+        run: |
+          ./build/fuzz/fuzz/make_seeds fuzz/corpus
+          mkdir -p fuzz/artifacts
+          ./build/fuzz/fuzz/wal_fuzz fuzz/corpus/wal -max_total_time=120 -artifact_prefix=fuzz/artifacts/
+          ./build/fuzz/fuzz/snapshot_fuzz fuzz/corpus/snapshot -max_total_time=120 -artifact_prefix=fuzz/artifacts/

@@ -3,3 +3,6 @@ target_link_libraries(vecs_info PRIVATE strata_bench_common strata_warnings)
 
 add_executable(compute_groundtruth compute_groundtruth.cpp)
 target_link_libraries(compute_groundtruth PRIVATE strata strata_bench_common strata_warnings)
+
+add_executable(crashtest crashtest.cpp)
+target_link_libraries(crashtest PRIVATE strata strata_warnings)

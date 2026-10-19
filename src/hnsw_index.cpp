@@ -2,28 +2,24 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstdio>
-#include <cstring>
 #include <limits>
 #include <stdexcept>
 
+#include "hnsw_entry.h"
 #include "strata/parallel.h"
 #include "visited_list.h"
 
 namespace strata {
+
+using hnsw::entry_level;
+using hnsw::entry_node;
+using hnsw::kMaxLevel;
+using hnsw::kNoEntry;
+using hnsw::pack_entry;
+
 namespace {
 
-constexpr std::uint64_t kNoEntry = ~std::uint64_t{0};
-constexpr int kMaxLevel = 30;
 constexpr std::size_t kFloatsPerCacheLine = 16;
-
-std::uint64_t pack_entry(std::uint32_t node, int level) {
-    return (static_cast<std::uint64_t>(level) << 32) | node;
-}
-
-std::uint32_t entry_node(std::uint64_t entry) { return static_cast<std::uint32_t>(entry); }
-
-int entry_level(std::uint64_t entry) { return static_cast<int>(entry >> 32); }
 
 // Turns a number into a well-mixed random-looking 64-bit value (splitmix64).
 std::uint64_t mix(std::uint64_t x) {
@@ -64,39 +60,6 @@ void write_results(const std::vector<C>& found, std::size_t k, std::span<RowId> 
         }
     }
 }
-
-// Small helpers for the temporary file format.
-struct FileCloser {
-    void operator()(std::FILE* f) const noexcept { std::fclose(f); }
-};
-using FilePtr = std::unique_ptr<std::FILE, FileCloser>;
-
-void write_bytes(std::FILE* f, const void* data, std::size_t bytes) {
-    if (bytes > 0 && std::fwrite(data, 1, bytes, f) != bytes) {
-        throw std::runtime_error("write failed while saving HNSW index");
-    }
-}
-
-void read_bytes(std::FILE* f, void* data, std::size_t bytes) {
-    if (bytes > 0 && std::fread(data, 1, bytes, f) != bytes) {
-        throw std::runtime_error("HNSW file is cut off or unreadable");
-    }
-}
-
-template <typename T>
-void write_value(std::FILE* f, T value) {
-    write_bytes(f, &value, sizeof(value));
-}
-
-template <typename T>
-T read_value(std::FILE* f) {
-    T value{};
-    read_bytes(f, &value, sizeof(value));
-    return value;
-}
-
-constexpr char kMagic[8] = {'S', 'T', 'R', 'H', 'N', 'S', 'W', '1'};
-constexpr std::uint32_t kFileVersion = 1;
 
 }  // namespace
 
@@ -327,6 +290,10 @@ void HnswIndex::add(std::span<const float> vectors, std::size_t threads) {
         return;
     }
 
+    insert_reserved(reserve(n), vectors, threads);
+}
+
+RowId HnswIndex::reserve(std::size_t n) {
     // Reserve a block of ids up front, so vector i always gets id first + i.
     std::size_t first = count_.load();
     do {
@@ -334,10 +301,39 @@ void HnswIndex::add(std::span<const float> vectors, std::size_t threads) {
             throw std::length_error("HNSW index is full");
         }
     } while (!count_.compare_exchange_weak(first, first + n));
+    return static_cast<RowId>(first);
+}
 
+void HnswIndex::insert_reserved(RowId first, std::span<const float> vectors, std::size_t threads) {
+    if (vectors.size() % dim_ != 0) {
+        throw std::invalid_argument("vector data size is not a multiple of dim");
+    }
+    const std::size_t n = vectors.size() / dim_;
+    if (first < 0 || static_cast<std::size_t>(first) + n > size()) {
+        throw std::invalid_argument("rows were not reserved");
+    }
+    const auto start = static_cast<std::size_t>(first);
     parallel_for(n, threads, [&](std::size_t i) {
-        insert(static_cast<NodeId>(first + i), vectors.data() + i * dim_);
+        insert(static_cast<NodeId>(start + i), vectors.data() + i * dim_);
     });
+}
+
+void HnswIndex::get_vector(RowId id, std::span<float> out) const {
+    if (id < 0 || static_cast<std::size_t>(id) >= size() || out.size() < dim_) {
+        throw std::invalid_argument("bad row id or output buffer");
+    }
+    const auto node = static_cast<NodeId>(id);
+    switch (encoding_) {
+        case Encoding::Float:
+            std::copy_n(vector_of(node), dim_, out.data());
+            break;
+        case Encoding::SQ8:
+            sq_->decode(code_of(node), out.data());
+            break;
+        case Encoding::PQ:
+            pq_->decode(code_of(node), out.data());
+            break;
+    }
 }
 
 void HnswIndex::insert(NodeId node, const float* vector) {
@@ -439,6 +435,35 @@ void HnswIndex::copy_links(NodeId node, int level, std::vector<NodeId>& out) con
     std::lock_guard lock(node_locks_[node]);
     const NodeId* block = links(node, level);
     out.assign(block + 1, block + 1 + block[0]);
+}
+
+void HnswIndex::copy_block(NodeId node, int level, NodeId limit, std::vector<NodeId>& out) const {
+    out.assign(1 + max_links(level), 0);
+    std::lock_guard lock(node_locks_[node]);
+    const NodeId* block = links(node, level);
+    NodeId kept = 0;
+    for (NodeId i = 0; i < block[0]; ++i) {
+        if (block[1 + i] < limit) {
+            out[1 + kept++] = block[1 + i];
+        }
+    }
+    out[0] = kept;
+}
+
+void HnswIndex::check_links(std::size_t n) const {
+    for (NodeId node = 0; node < n; ++node) {
+        for (int l = 0; l <= levels_[node]; ++l) {
+            const NodeId* block = links(node, l);
+            bool ok = block[0] <= max_links(l);
+            for (NodeId i = 0; ok && i < block[0]; ++i) {
+                const NodeId other = block[1 + i];
+                ok = other < n && levels_[other] >= l;
+            }
+            if (!ok) {
+                throw std::runtime_error("snapshot has invalid links");
+            }
+        }
+    }
 }
 
 template <typename Query>
@@ -699,105 +724,6 @@ HnswStats HnswIndex::stats() const {
                      (level0_links_.size() + upper_slots) * sizeof(NodeId) + levels_.size() +
                      capacity_ * (sizeof(std::mutex) + sizeof(std::vector<NodeId>));
     return s;
-}
-
-void HnswIndex::save(const std::string& path) const {
-    if (encoding_ != Encoding::Float) {
-        throw std::logic_error("save() only supports indexes that store full vectors");
-    }
-    FilePtr f(std::fopen(path.c_str(), "wb"));
-    if (!f) {
-        throw std::runtime_error("cannot open '" + path + "' for writing");
-    }
-    const std::size_t n = size();
-    write_bytes(f.get(), kMagic, sizeof(kMagic));
-    write_value(f.get(), kFileVersion);
-    write_value(f.get(), static_cast<std::uint32_t>(metric_));
-    write_value(f.get(), static_cast<std::uint64_t>(dim_));
-    write_value(f.get(), static_cast<std::uint64_t>(params_.M));
-    write_value(f.get(), static_cast<std::uint64_t>(params_.ef_construction));
-    write_value(f.get(), params_.seed);
-    write_value(f.get(), static_cast<std::uint64_t>(n));
-    write_value(f.get(), entry_.load(std::memory_order_acquire));
-
-    for (NodeId node = 0; node < n; ++node) {
-        write_bytes(f.get(), vector_of(node), dim_ * sizeof(float));
-    }
-    write_bytes(f.get(), levels_.data(), n);
-    write_bytes(f.get(), level0_links_.data(), n * (1 + max_links_level0_) * sizeof(NodeId));
-    for (NodeId node = 0; node < n; ++node) {
-        write_bytes(f.get(), upper_links_[node].data(), upper_links_[node].size() * sizeof(NodeId));
-    }
-    if (std::fclose(f.release()) != 0) {
-        throw std::runtime_error("close failed for '" + path + "'");
-    }
-}
-
-std::unique_ptr<HnswIndex> HnswIndex::load(const std::string& path, std::size_t capacity) {
-    FilePtr f(std::fopen(path.c_str(), "rb"));
-    if (!f) {
-        throw std::runtime_error("cannot open '" + path + "'");
-    }
-    char magic[sizeof(kMagic)];
-    read_bytes(f.get(), magic, sizeof(magic));
-    if (std::memcmp(magic, kMagic, sizeof(kMagic)) != 0 ||
-        read_value<std::uint32_t>(f.get()) != kFileVersion) {
-        throw std::runtime_error("'" + path + "' is not a StrataDB HNSW file");
-    }
-    const auto metric_value = read_value<std::uint32_t>(f.get());
-    const auto dim = read_value<std::uint64_t>(f.get());
-    HnswParams params;
-    params.M = read_value<std::uint64_t>(f.get());
-    params.ef_construction = read_value<std::uint64_t>(f.get());
-    params.seed = read_value<std::uint64_t>(f.get());
-    const auto n = read_value<std::uint64_t>(f.get());
-    const auto entry = read_value<std::uint64_t>(f.get());
-    if (metric_value > static_cast<std::uint32_t>(Metric::Cosine) || dim == 0 || dim > 65536 ||
-        params.M < 2 || params.M > 1024 || n >= std::numeric_limits<NodeId>::max()) {
-        throw std::runtime_error("'" + path + "' has an invalid header");
-    }
-
-    auto index = std::make_unique<HnswIndex>(dim, static_cast<Metric>(metric_value),
-                                             std::max<std::size_t>({capacity, n, 1}), params);
-    for (NodeId node = 0; node < n; ++node) {
-        read_bytes(f.get(), index->vector_of(node), dim * sizeof(float));
-    }
-    read_bytes(f.get(), index->levels_.data(), n);
-    read_bytes(f.get(), index->level0_links_.data(),
-               n * (1 + index->max_links_level0_) * sizeof(NodeId));
-    for (NodeId node = 0; node < n; ++node) {
-        const int level = index->levels_[node];
-        if (level > kMaxLevel) {
-            throw std::runtime_error("'" + path + "' has an invalid node level");
-        }
-        if (level > 0) {
-            index->upper_links_[node].resize(static_cast<std::size_t>(level) * (1 + params.M));
-            read_bytes(f.get(), index->upper_links_[node].data(),
-                       index->upper_links_[node].size() * sizeof(NodeId));
-        }
-    }
-
-    // Check every link so a damaged file can't make a search read out of bounds.
-    for (NodeId node = 0; node < n; ++node) {
-        for (int l = 0; l <= index->levels_[node]; ++l) {
-            const NodeId* block = index->links(node, l);
-            bool ok = block[0] <= index->max_links(l);
-            for (NodeId i = 0; ok && i < block[0]; ++i) {
-                const NodeId other = block[1 + i];
-                ok = other < n && index->levels_[other] >= l;
-            }
-            if (!ok) {
-                throw std::runtime_error("'" + path + "' has invalid links");
-            }
-        }
-    }
-    if (n > 0 && (entry == kNoEntry || entry_node(entry) >= n ||
-                  entry_level(entry) != index->levels_[entry_node(entry)])) {
-        throw std::runtime_error("'" + path + "' has an invalid entry point");
-    }
-    index->count_.store(n);
-    index->entry_.store(n > 0 ? entry : kNoEntry);
-    return index;
 }
 
 }  // namespace strata

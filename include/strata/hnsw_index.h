@@ -11,6 +11,7 @@
 
 #include "strata/aligned_buffer.h"
 #include "strata/distance.h"
+#include "strata/file_system.h"
 #include "strata/flat_index.h"
 #include "strata/metric.h"
 #include "strata/quantizer.h"
@@ -93,6 +94,15 @@ public:
     // (0 = all cores). Vector i gets row id size() + i. Throws if capacity would be exceeded.
     void add(std::span<const float> vectors, std::size_t threads = 1);
 
+    // add() in two steps, for callers that must know the row ids before inserting
+    // (the database logs them first). reserve(n) hands out ids [first, first + n),
+    // insert_reserved() fills them in.
+    RowId reserve(std::size_t n);
+    void insert_reserved(RowId first, std::span<const float> vectors, std::size_t threads = 1);
+
+    // The vector stored for a row: normalized for Cosine, decoded if compressed.
+    void get_vector(RowId id, std::span<float> out) const;
+
     // Finds about the k closest vectors, closest first. ef_search is how many
     // candidates to track: higher is more accurate but slower (at least k is used).
     // Unused output slots get kNoRow and +infinity.
@@ -114,8 +124,30 @@ public:
     // Graph statistics. Don't call while add() is running.
     HnswStats stats() const;
 
-    // Simple file format, not crash-safe: a crash during save() can leave a broken file.
-    // Only indexes that store full vectors can be saved. Don't call save() while add() is running.
+    // What a snapshot holds: the first `count` nodes and the entry point they had.
+    struct SavePoint {
+        std::size_t count = 0;
+        std::uint64_t entry = 0;
+    };
+    // Call while no add() is running. Later adds don't change what it describes.
+    SavePoint save_point() const;
+
+    // Writes a checksummed snapshot file (format in docs/file-format.md). It is
+    // written under a temporary name and renamed when complete, so a crash never
+    // leaves a half-written file at path. add() may keep running meanwhile;
+    // links to nodes added after the save point are left out.
+    void save_snapshot(FileSystem& fs, const std::string& path, const SavePoint& point,
+                       std::uint64_t wal_lsn) const;
+
+    struct LoadedSnapshot {
+        std::unique_ptr<HnswIndex> index;
+        std::uint64_t wal_lsn = 0;
+    };
+    // Checks every checksum and link before returning. capacity 0 keeps the saved one.
+    static LoadedSnapshot load_snapshot(FileSystem& fs, const std::string& path,
+                                        std::size_t capacity = 0);
+
+    // The same on the local disk. Don't call save() while add() is running.
     void save(const std::string& path) const;
     static std::unique_ptr<HnswIndex> load(const std::string& path, std::size_t capacity = 0);
 
@@ -174,6 +206,10 @@ private:
 
     // Copies a node's neighbor list while holding that node's lock.
     void copy_links(NodeId node, int level, std::vector<NodeId>& out) const;
+    // Copies a whole link block (count and all slots), keeping only links below `limit`.
+    void copy_block(NodeId node, int level, NodeId limit, std::vector<NodeId>& out) const;
+    // Throws if any link points outside the first n nodes or to a node too low for it.
+    void check_links(std::size_t n) const;
 
     // Moves towards the query on one layer until no neighbor is closer.
     template <typename Query>

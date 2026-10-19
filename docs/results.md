@@ -92,3 +92,61 @@ Index memory includes the graph links, which are not compressed.
   what makes it usable: 200 re-scored candidates reach 0.955.
 - 64x PQ (48 pieces) does not reach 0.95 on this dataset even with 400 re-scored
   candidates. 32x is the practical limit for plain PQ here.
+
+## Durability, SIFT
+
+`./build/release/bench/durability_bench insert` and `... recovery`
+
+128 dimensions, M = 16, ef_construction = 200. The log and database live on the
+laptop's NVMe SSD (ext4). Each insert is one vector; "database" means the whole
+`Database::insert` (log, then HNSW insert), "log only" is the write-ahead log alone.
+
+### Insert throughput by sync mode
+
+| Sync mode | Threads | Log only (inserts/s) | Database (inserts/s) | Inserts per fdatasync | Database p99 (us) |
+|---|---|---|---|---|---|
+| every-write | 1 | 1,549 | 1,140 | 1.0 | 1,394 |
+| every-write | 16 | 1,415 | 1,221 | 1.0 | 21,139 |
+| group | 1 | 1,520 | 1,140 | 1.0 | 1,337 |
+| group | 4 | 3,781 | 2,962 | 2.0 | 1,965 |
+| group | 8 | 6,513 | 5,989 | 4.0 | 1,811 |
+| group | 16 | 11,285 | 9,702 | 7.9 | 2,668 |
+| none | 1 | 653,618 | 9,335 | - | 228 |
+| none | 16 | 305,379 | 26,779 | - | 3,436 |
+
+- One fdatasync takes about 0.65 ms on this SSD, so syncing every record on its own
+  tops out near 1,500 per second however many threads write.
+- Group commit lets writers that arrive during a sync share the next one. With 16
+  threads it reaches 9,702 durable inserts per second, 7.9x every-write, with the
+  same guarantee: nothing is acknowledged before it is on disk.
+- With no syncs, the HNSW insert itself is the limit (about 9,300 per second on one
+  thread).
+
+### Recovery time
+
+A snapshot of 800,000 vectors (496 MiB, written in 0.62 s), plus a log of N
+inserts written after it. Time to open the database:
+
+| Log records since checkpoint | Snapshot load (s) | Replay, 1 thread (s) | Replay, 12 threads (s) |
+|---|---|---|---|
+| 0 | 0.38 | 0.00 | 0.00 |
+| 20,000 | 0.40 | 5.39 | 2.36 |
+| 50,000 | 0.40 | 14.05 | 5.83 |
+| 100,000 | 0.42 | 27.58 | 11.92 |
+| 200,000 | 0.49 | 60.59 | 24.61 |
+
+- Loading the snapshot is fast (about 1.3 GB/s, file already in the page cache).
+  Replaying the log is slow, because each record is a full HNSW insert.
+- So recovery time is set by the checkpoint interval: about 0.12 ms per record
+  since the last checkpoint with 12 threads. Since a checkpoint costs well under a
+  second, checkpointing every 20,000 to 50,000 inserts keeps recovery under a few seconds.
+
+### Crash testing
+
+| Test | Result |
+|---|---|
+| Kill-9 crash test, group commit | 10,000 crashes, 188,462 acknowledged inserts checked, none lost or damaged |
+| Kill-9 crash test, every-write | 3,000 crashes, 19,124 acknowledged inserts, none lost or damaged |
+| Kill-9 crash test, no sync | 3,000 crashes, 139,621 acknowledged inserts, none lost or damaged |
+| libFuzzer + AddressSanitizer, log reader and recovery | 1 hour, 18.6M inputs, no crashes |
+| libFuzzer + AddressSanitizer, snapshot loader | 1 hour, 46.1M inputs, no crashes |
